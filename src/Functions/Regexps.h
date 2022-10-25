@@ -254,7 +254,7 @@ inline Regexps constructRegexps(const std::vector<String> & str_patterns, [[mayb
 
     /// If not HS_SUCCESS, it is guaranteed that the memory would not be allocated for scratch.
     if (err != HS_SUCCESS)
-        throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not allocate scratch space for hyperscan");
+        throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not allocate scratch space for vectorscan");
 
     return {db, scratch};
 }
