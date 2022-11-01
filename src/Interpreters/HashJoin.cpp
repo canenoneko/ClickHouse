@@ -258,8 +258,8 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
         LOG_TRACE(log, "Joining on: {}", fmt::join(log_text, " | "));
     }
 
-    JoinCommon::convertToFullColumnsInplace(right_table_keys);
     initRightBlockStructure(data->sample_block);
+    JoinCommon::convertToFullColumnsInplace(right_table_keys);
 
     JoinCommon::createMissedColumns(sample_block_with_columns_to_add);
 
