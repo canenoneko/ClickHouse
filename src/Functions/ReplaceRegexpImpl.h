@@ -178,7 +178,7 @@ struct ReplaceRegexpImpl
         ++res_offset;
     }
 
-#ifdef USE_VECTORSCAN
+#if USE_VECTORSCAN
     static void processStringWithVectorscan(
         const char * haystack_data,
         size_t haystack_length,
@@ -275,6 +275,25 @@ struct ReplaceRegexpImpl
     }
 #endif
 
+    struct MatchState
+    {
+#if USE_VECTORSCAN
+        std::mutex mutex;
+        hs_database_t * db TSA_GUARDED_BY(mutex) = nullptr;
+        hs_scratch_t * scratch TSA_GUARDED_BY(mutex) = nullptr;
+
+        ~MatchState()
+        {
+            std::scoped_lock lock(mutex);
+            assert((!db && !scratch) || (db && !scratch) || (db && scratch)); // (!db && scratch) should be impossible
+            if (scratch)
+                hs_free_scratch(scratch);
+            if (db)
+                hs_free_database(db);
+        }
+#endif
+    };
+
     static void vector(
         const ColumnString::Chars & data,
         const ColumnString::Offsets & offsets,
@@ -282,7 +301,8 @@ struct ReplaceRegexpImpl
         const String & replacement,
         ColumnString::Chars & res_data,
         ColumnString::Offsets & res_offsets,
-        bool allow_hyperscan)
+        [[maybe_unused]] bool allow_hyperscan,
+        [[maybe_unused]] MatchState & match_state)
     {
         ColumnString::Offset res_offset = 0;
         res_data.reserve(data.size());
@@ -303,7 +323,7 @@ struct ReplaceRegexpImpl
 
         int num_captures_in_needle = searcher.NumberOfCapturingGroups();
 
-#ifdef USE_VECTORSCAN
+#if USE_VECTORSCAN
         /// Vectorscan matches generally faster than re2. The caveat is that vectorscan recognizes
         /// capturing groups but ignores them, so we can use vectorscan only when the pattern has
         /// zero capturing groups.
@@ -318,34 +338,45 @@ struct ReplaceRegexpImpl
             /// because we rely on the HS_FLAG_SOM_LEFTMOST flag here and the other usages of vectorscan
             /// in ClickHouse don't.
 
-            hs_database_t * db = nullptr;
-            hs_compile_error_t * compile_error = nullptr;
+            hs_error_t err;
 
-            hs_error_t err = hs_compile(
-                needle.c_str(),
-                HS_FLAG_SOM_LEFTMOST | HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY | HS_FLAG_UTF8,
-                HS_MODE_BLOCK,
-                nullptr,
-                &db,
-                &compile_error);
-
-            if (err != HS_SUCCESS)
+            /// Construct the database + scratch area once instead of once per chunk.
             {
-                SCOPE_EXIT({ hs_free_compile_error(compile_error); });
-                throw Exception(
-                        ErrorCodes::LOGICAL_ERROR,
-                        compile_error->message);
+                std::scoped_lock lock(match_state.mutex);
+
+                if (match_state.db == nullptr) [[unlikely]]
+                {
+                    hs_compile_error_t * compile_error = nullptr;
+
+                    err = hs_compile(
+                        needle.c_str(),
+                        HS_FLAG_SOM_LEFTMOST | HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY | HS_FLAG_UTF8,
+                        HS_MODE_BLOCK,
+                        nullptr,
+                        &match_state.db,
+                        &compile_error);
+                    if (err != HS_SUCCESS)
+                    {
+                        SCOPE_EXIT({ hs_free_compile_error(compile_error); });
+                        throw Exception(
+                                ErrorCodes::LOGICAL_ERROR,
+                                compile_error->message);
+                    }
+                }
+
+                if (match_state.scratch == nullptr) [[unlikely]]
+                {
+                    err = hs_alloc_scratch(match_state.db, &match_state.scratch);
+                    if (err != HS_SUCCESS)
+                        throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not allocate scratch space for vectorscan");
+                }
             }
 
-            SCOPE_EXIT({ hs_free_database(db); });
-
-            hs_scratch_t * scratch = nullptr;
-
-            err = hs_alloc_scratch(db, &scratch);
+            hs_scratch_t * local_scratch = nullptr;
+            err = hs_clone_scratch(TSA_SUPPRESS_WARNING_FOR_READ(match_state.scratch), &local_scratch);
             if (err != HS_SUCCESS)
-                throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not allocate scratch space for vectorscan");
-
-            SCOPE_EXIT({ hs_free_scratch(scratch); });
+                throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not clone scratch space for vectorscan");
+            SCOPE_EXIT({ hs_free_scratch(local_scratch); });
 
             Instructions instructions = createInstructions(replacement, num_captures_in_needle /* "\0" capture */ + 1);
 
@@ -355,7 +386,7 @@ struct ReplaceRegexpImpl
                 const char * haystack_data = reinterpret_cast<const char *>(data.data() + from);
                 size_t haystack_length = static_cast<unsigned>(offsets[i] - from - 1);
 
-                processStringWithVectorscan(haystack_data, haystack_length, res_data, res_offset, db, scratch, instructions);
+                processStringWithVectorscan(haystack_data, haystack_length, res_data, res_offset, TSA_SUPPRESS_WARNING_FOR_READ(match_state.db), local_scratch, instructions);
                 res_offsets[i] = res_offset;
             }
 
@@ -383,7 +414,8 @@ struct ReplaceRegexpImpl
         const String & replacement,
         ColumnString::Chars & res_data,
         ColumnString::Offsets & res_offsets,
-        bool allow_hyperscan)
+        [[maybe_unused]] bool allow_hyperscan,
+        [[maybe_unused]] MatchState & match_state)
     {
         ColumnString::Offset res_offset = 0;
         size_t size = data.size() / n;
@@ -404,7 +436,7 @@ struct ReplaceRegexpImpl
 
         int num_captures_in_needle = searcher.NumberOfCapturingGroups();
 
-#ifdef USE_VECTORSCAN
+#if USE_VECTORSCAN
         /// Vectorscan matches generally faster than re2. The caveat is that vectorscan recognizes
         /// capturing groups but ignores them, so we can use vectorscan only when the pattern has
         /// zero capturing groups.
@@ -419,34 +451,45 @@ struct ReplaceRegexpImpl
             /// because we rely on the HS_FLAG_SOM_LEFTMOST flag here and the other usages of vectorscan
             /// in ClickHouse don't.
 
-            hs_database_t * db = nullptr;
-            hs_compile_error_t * compile_error = nullptr;
+            hs_error_t err;
 
-            hs_error_t err = hs_compile(
-                needle.c_str(),
-                HS_FLAG_SOM_LEFTMOST | HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY | HS_FLAG_UTF8,
-                HS_MODE_BLOCK,
-                nullptr,
-                &db,
-                &compile_error);
-
-            if (err != HS_SUCCESS)
+            /// Construct the database + scratch area once instead of once per chunk.
             {
-                SCOPE_EXIT({ hs_free_compile_error(compile_error); });
-                throw Exception(
-                        ErrorCodes::LOGICAL_ERROR,
-                        compile_error->message);
+                std::scoped_lock lock(match_state.mutex);
+
+                if (match_state.db == nullptr) [[unlikely]]
+                {
+                    hs_compile_error_t * compile_error = nullptr;
+
+                    err = hs_compile(
+                        needle.c_str(),
+                        HS_FLAG_SOM_LEFTMOST | HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY | HS_FLAG_UTF8,
+                        HS_MODE_BLOCK,
+                        nullptr,
+                        &match_state.db,
+                        &compile_error);
+                    if (err != HS_SUCCESS)
+                    {
+                        SCOPE_EXIT({ hs_free_compile_error(compile_error); });
+                        throw Exception(
+                                ErrorCodes::LOGICAL_ERROR,
+                                compile_error->message);
+                    }
+                }
+
+                if (match_state.scratch == nullptr) [[unlikely]]
+                {
+                    err = hs_alloc_scratch(match_state.db, &match_state.scratch);
+                    if (err != HS_SUCCESS)
+                        throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not allocate scratch space for vectorscan");
+                }
             }
 
-            SCOPE_EXIT({ hs_free_database(db); });
-
-            hs_scratch_t * scratch = nullptr;
-
-            err = hs_alloc_scratch(db, &scratch);
+            hs_scratch_t * local_scratch = nullptr;
+            err = hs_clone_scratch(TSA_SUPPRESS_WARNING_FOR_READ(match_state.scratch), &local_scratch);
             if (err != HS_SUCCESS)
-                throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not allocate scratch space for vectorscan");
-
-            SCOPE_EXIT({ hs_free_scratch(scratch); });
+                throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Could not clone scratch space for vectorscan");
+            SCOPE_EXIT({ hs_free_scratch(local_scratch); });
 
             Instructions instructions = createInstructions(replacement, num_captures_in_needle /* "\0" capture */ + 1);
 
@@ -456,7 +499,7 @@ struct ReplaceRegexpImpl
                 const char * haystack_data = reinterpret_cast<const char *>(data.data() + from);
                 size_t haystack_length = n;
 
-                processStringWithVectorscan(haystack_data, haystack_length, res_data, res_offset, db, scratch, instructions);
+                processStringWithVectorscan(haystack_data, haystack_length, res_data, res_offset, TSA_SUPPRESS_WARNING_FOR_READ(match_state.db), local_scratch, instructions);
                 res_offsets[i] = res_offset;
             }
 
